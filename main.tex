@@ -1,0 +1,415 @@
+\documentclass[12pt]{article}
+
+\usepackage{sbc-template}
+\usepackage{minted}
+\usepackage{graphicx,url}
+\usepackage{tabularx}
+
+%\usepackage[brazil]{babel}   
+\usepackage[utf8]{inputenc}
+     
+\sloppy
+
+\title{Consultas em Binários Utilizando o Ecossistema BEAM}
+
+\author{Daniel Santos Santana\inst{1}, João de Deus Ferreira Filho\inst{1} }
+
+\address{Instituto de Ciência Exatas e Naturais, Universidade Federal do Pará (UFPA)\\
+  Rua Augusto Corrêa, 01 – Guamá – Belém - PA - Brasil
+\\
+  \email{\{daniel.santana.1661,lubien1996\}@gmail.com}
+}
+
+\begin{document} 
+
+\maketitle
+
+\begin{abstract}
+  This paper focuses on describing the experiences gained by the team over
+  and experiment over querying a huge binary file. From an overview of BEAM's
+  concurrency model to the actual implementation of the querying system we
+  present our conclusions over the exploration of new lands.
+\end{abstract}
+     
+\begin{resumo} 
+  Este artigo foca em descrever as experiências ganhadas pela dupla acima
+  de um experimento de consultar um largo arquivo binário. Desde uma visão
+  geral do modelo de concorrência implementado por BEAM até a real implementação
+  do sistema de consultas, apresentamos conclusões sobre a exploração destas novas terras.
+\end{resumo}
+
+
+\section{Introdução}
+
+Orientando-se pela proposta de atividade avaliativa para a disciplina Bancos de
+Dados II da Universidade Federal do Pará conduzida pelo professor Gustavo Pinto,
+a dupla de alunos gerou uma maneira de consultar dados através de um arquivo
+binário contendo oito milhões de tuplas de 64 \textit{bits} representando, cada
+uma, um indivíduo. Este artigo contempla uma introdução ao modelo de concorrência
+do ecossistema BEAM, seguido de bibliotecas importantes para a manutenção do
+paradigma de processamento e caminha a resultados obtidos, análise e conclusão. 
+
+\section{O Ecossistema BEAM} \label{sec:firstpage}
+
+A máquina virtual BEAM (\textit{Bogdan's Erlang Abstract Machine}, batizada ao
+nome da pessoa quem escreveu a versão original) fornece o ambiente para a execução
+do \textit{bytecode} gerado por código fonte da linguagem de programação 
+\textit{erlang}. Ao decorrer dos anos, outras linguagens foram acrescentadas ao
+ecossistema como \textit{lisp flavored erlang}, \textit{haskerl}, \textit{clojerl}
+e a linguagem principal do projeto, Elixir. Vantagem destas é o alto nível
+de interoperabilidade com a linguagem pai, especialmente no que diz respeito aos 
+protocolos de concorrência.
+
+Como paradigma de concorrência, a máquina virtual trabalha com o modelo de ator.
+Atores são unidades mínima de concorrência onde são responsáveis por encapsular
+computações e comunicar-se através de mensagens com outros atores ou até mesmo
+gerar novos atores. Vantagem primária é a criação de algoritmos \textit{thread safe}
+por padrão, além de tornar simplificado a capacidade de distribuir peso computacional
+entre diferentes atores que irão computá-los e retorna os respectivos resultados.
+
+A linguagem de escolha foi Elixir, relativamente nova porém robusta posto que mais se
+comporta como um \textit{superset} de \textit{erlang} fornecendo uma grande caixa de
+ferramentas e abstrações simplificadas para tratar computações que logo mais são traduzidas
+para o mesmo \textit{bytecode} da linguagem pai. Outro motivo da escolha fora a facilidade
+com a linguagem é capaz de tratar protocolos binários uma vez que \textit{bits} são cidadães
+de primeira classe. Como exemplo, o trecho de código abaixo demonstra como reconhecer o
+padrão de gênero em uma tupla.
+
+\begin{minted}{elixir}
+defmodule Database.Person do
+    def get_gender(<<gender::1, _rest::63>>), do: gender
+end
+\end{minted}
+
+\section{Modelo de Concorrência}
+
+Com intenção de tirar máximo proveito do potencial da máquina, diferentes atores conduzem
+\textbf{estágios} de processamento de cada consulta. Alguns momentos mais simples podendo
+ser realizados por um ator enquanto outros necessitam de estágios concorrentes. Os passos 
+realizados pelas consultas, em suma, são:
+
+\begin{enumerate}
+    \item Ler uma \textit{stream} do arquivo.
+    \item Filtrar.
+    \item Transformar.
+    \item Concatenar.
+    \item Sincronizar.
+\end{enumerate}
+
+Para o passo 1 um único ator responsabiliza-se por ler uma \textit{stream} do arquivo
+em pedaços(\textit{chunks}) que contém 10 mil pessoas cada, um total de 80 mil bytes, além
+disso, as leituras mascaram o fato que as chamadas ao sistema operacional pedem o triplo
+desta quantidade (\textit{read ahead}), gerando \textit{buffers} que esperam as próximas 
+chamadas assim diminuindo a quantidade real de chamadas sem delegar demasiado tempo ao 
+processo de leitura. Quanto maior o \textit{read ahead}, a dupla verificou espaços de tempo
+em que atores de processamento ficavam ociosos. A escolha de agrupar pessoas em grupos de 10 
+mil se deu a necessidade de diminuir a quantidade de mensagens sendo passadas entre os processos.
+O custo de se passar uma quantidade maior de mensagens impactava gravemente no tempo de execução total.
+
+Uma vez que o processo de leitura é iniciado, criam-se 16 atores chamados estágios. 
+Cada grupo de pessoas lido é distribuído igualmente entre estes atores. Para a escolha do número,
+a equipe utilizou-se de testes empíricos. Uma quantidade de até 4 atores resultava em subutilização de
+dados lidos uma vez que existe o tempo em que atores estão a esperar por mensagens e não processando elas.
+Todavia, números maiores que 16 a primeiro momento não agregam eficiência ao processamento total e em
+maiores quantidades apenas se tornam um fardo que efetivamente deteriora a performance. Cada estágio realiza
+individualmente os passos 2, 3 e 4 para cada grupo recebido.
+
+Iterando através de cada pessoa em um grupo, o estágio utiliza-se de uma função de teste para o filtro, quando
+necessário, uma função de mapeamento e uma função de concatenação que serão comentado posteriormente com mais
+detalhes. No fim destes processos, uma estrutura do Elixir chamada \textit{Map} é o produto do estágio do grupo.
+O estágio mantém consigo os mapas produzidos e os concatena, mantendo consigo um estado parcial do resultado final.
+
+No passo 6, o último, uma vez que todos atores terminaram seu processamento e não há mais leituras no primeiro ator,
+os estágios fornecem seus acumuladores e uma fase de sincronização acontece, gerando o estado final, o resultado da
+consulta.
+
+\section{Agrupamento}
+
+Brevemente mencionado na seção anterior, ocorre um momento de transformação de cada pessoa. Este passo é parte
+essencial do algoritmo de agrupamento que, utilizando-se da ideia de tabelas de dispersão (\textit{hash tables}) e
+se aproveitando da estrutura de dados \textit{Map} do Elixir que fornece leituras e escritas eficientes, bastou
+criar-se uma função de \textit{hashing} que definia a qual grupo cada pessoa pertence para tornar agrupamento possível.
+
+As função de \textit{hashing} adotadas pela dupla convém da ideia de concatenar os \textit{bits} relevantes ao
+grupo e gerar um inteiro desta representação. Uma vez conhecido a chave, contagens podem ser realizadas em agrupamentos
+de pessoas. O exemplo abaixo demonstra como capturar e concatenar os \textit{bits} que definem o agrupamento 
+de gênero e país de uma pessoa e como recuperar os valores originais.
+
+\begin{minted}{elixir}
+defmodule Database.Hashing do
+  def hash_gender_country(<<gender::1, _::31, country::8, _::24>>) do
+    <<hashed::9>> = <<gender::1, country::8>>
+    hashed
+  end
+  
+  def unhash_gender_country(hashed) do
+    <<gender::1, country::8>> = <<hashed::9>>
+    {gender, country}
+  end
+end
+\end{minted}
+
+Devido ao grau de semelhança entre as implementações de consulta, módulos externos
+foram desenvolvidos para encapsular código repetitivo. Abaixo, um trecho que representa
+a primeira consulta do trabalho:
+
+\begin{minted}{elixir}
+def count_by_country_and_gender(file \\ @db_file) do
+    Utils.generic_hashing_count(
+      file,
+      &Hashing.hash_gender_country/1,
+      &Hashing.unhash_gender_country/1
+    )
+    |> Enum.map(fn {{gender, country}, count} ->
+      %{
+        "country" => Person.translate(:country, country),
+        "gender" => Person.translate(:gender, gender),
+        "count" => count
+      }
+    end)
+end
+\end{minted}
+
+Funções de tradução foram implementadas meramente por questões estéticas. Gêneros
+são mapeados para palavras e países são mapeados para, falsos, códigos de caracteres de países.
+
+\section{O Banco Binário}
+
+Para a criação do banco foi utilizado \textit{/dev/urandom}. O banco possui exatos
+8GB, isto é, 1 bilhão de tuplas de 8 \textit{bytes}.
+
+\begin{minted}{bash}
+> time head -c 8000000000 </dev/urandom >people.db
+> ls -la priv/
+total 9697920
+drwxr-xr-x  2 lubien lubien       4096 out 20 21:56 .
+drwxr-xr-x 10 lubien lubien       4096 out 22 01:51 ..
+-rw-r--r--  1 lubien lubien 8000000000 out 20 16:06 people.db
+
+\end{minted}
+
+\section{O SGBD}
+
+Como sistema gerenciador de banco de dados, \textit{PostgreSQL} foi a escolha. Criado o banco "ufpa-databases-2",
+o seguinte comando DDL foi executado para a criação da tabela.
+
+\begin{minted}{sql}
+create table if not exists people (
+  gender int,
+  age int,
+  income int,
+  scholarity int,
+  idiom int,
+  country int,
+  coordinates int
+)
+\end{minted}
+
+A importação se deu através de um arquivo \textit{csv} gerado baseado no banco binário. Um \textit{script}
+de exportação foi criado para popular o \textit{csv}, gerando um total de 27GB. Em seguida,
+dentro da interface \textit{psql} o comando COPY foi executado. A seguir o retorno do
+processo de importação.
+
+\begin{minted}{bash}
+> make dump-database
+mix compile
+Compiling 1 file (.ex)
+time mix export > dump.csv
+
+real  34m22,876s
+user  102m27,970s
+sys  9m58,195s
+
+> make import-dump
+time psql -U "postgres" \
+    -d "ufpa-databases-2" -a \
+    -c "\copy people from dump.csv with csv"
+copy people from dump.csv with csv
+COPY 1000000000
+
+real  39m16,417s
+user  2m2,971s
+sys  0m24,367s
+\end{minted}
+
+Após importar, foi verificado que o banco pesa 58GB.
+
+\begin{minted}{bash}
+> psql -U postgres -d ufpa-databases-2
+psql (10.5)
+Digite "help" para ajuda.
+
+ufpa-databases-2=# show data_directory;
+     data_directory     
+------------------------
+ /var/lib/postgres/data
+(1 registro)
+
+ufpa-databases-2=# \quit
+
+> sudo du -sh /var/lib/postgres/data
+58G  /var/lib/postgres/data
+\end{minted}
+
+\section{Especificações}
+
+A seguir algumas informaçõe acerca da máquina utilizada para as consultas.
+
+\begin{minted}{bash}
+> neofetch
+OS: Manjaro Linux x86_64 
+Host: B250M-D3H 
+Kernel: 4.14.77-1-MANJARO 
+Uptime: 12 hours, 58 mins 
+Packages: 1024 (pacman) 
+Shell: bash 4.4.23 
+Resolution: 1360x768, 2560x1080 
+DE: Xfce 
+Theme: Vertex-Maia [GTK2], Breath [GTK3] 
+Icons: Vertex-Maia [GTK2], hicolor [GTK3] 
+Terminal: xfce4-terminal 
+Terminal Font: Monospace 12 
+CPU: Intel i5-7400 (4) @ 3.500GHz 
+GPU: NVIDIA GeForce GT 610 
+Memory: 3204MiB / 7939MiB
+\end{minted}
+
+\begin{minted}{bash}
+> lscpu
+Arquitetura:                x86_64
+Modo(s) operacional da CPU: 32-bit, 64-bit
+Ordem dos bytes:            Little Endian
+CPU(s):                     4
+Lista de CPU(s) on-line:    0-3
+Thread(s) per núcleo:       1
+Núcleo(s) por soquete:      4
+Soquete(s):                 1
+Nó(s) de NUMA:              1
+ID de fornecedor:           GenuineIntel
+Família da CPU:             6
+Modelo:                     158
+Nome do modelo:             Intel(R) Core(TM) i5-7400 CPU @ 3.00GHz
+Step:                       9
+CPU MHz:                    800.050
+CPU MHz máx.:               3500,0000
+CPU MHz mín.:               800,0000
+BogoMIPS:                   6002.00
+Virtualização:              VT-x
+cache de L1d:               32K
+cache de L1i:               32K
+cache de L2:                256K
+cache de L3:                6144K
+CPU(s) de nó0 NUMA:         0-3
+\end{minted}
+
+\begin{minted}{bash}
+> sudo hdparm -Tt /dev/sda
+
+/dev/sda:
+ Timing cached reads:   26046 MB in  1.99 seconds = 13068.87 MB/sec
+ Timing buffered disk reads: 392 MB in  3.00 seconds = 130.50 MB/sec
+\end{minted}
+
+No que diz respeito à linguagem de programação.
+
+\begin{minted}{bash}
+> elixir --version
+Erlang/OTP 21 [erts-10.1.1] [source] [64-bit] [smp:4:4] [ds:4:4:10]
+[async-threads:1] [hipe]
+
+Elixir 1.7.3 (compiled with Erlang/OTP 21)
+\end{minted}
+
+No que diz respeito ao SGBD.
+
+\begin{minted}{bash}
+> pg_config --version
+PostgreSQL 10.5
+\end{minted}
+
+\section{Comparação}
+
+Abaixo segue a tabela de comparação dos tempos de execução entre as consultas no
+SGBD e na implementação da dupla.
+
+\begin{center}
+\begin{tabular}{ccccc}
+Consulta    & Primeira (SGBD) & Primeira (Bin)  & Média (SGBD) & Média (Bin) \\
+1           & 748s            & 134s            & 640s         & 134s        \\
+2           & -               & 456s            & -            & 453s        \\
+3           & 629s            & 160s            & 622s         & 161s        \\
+4           & 620s            & 173s            & 614s         & 163s        \\
+5           & 705s            & 59s             & 618s         & 59s         \\
+6           & 861s            & 63s             & 623s         & 61s         \\
+7           & 631s            & 67s             & 604s         & 62s         \\
+8           & 619s            & 60s             & 622s         & 59s         \\
+9           & 639s            & 59s             & 626s         & 60s         \\
+10          & 622s            & 61s             & 628s         & 60s             
+\end{tabular}
+\end{center}
+
+Os resultados da consulta 2 para o SGBD foram ignorados posto que após uma hora
+de processamento não houve nenhum retorno. As 3 últimas consultas são, respectivamente:
+
+\begin{minted}{sql}
+SELECT country, scholarity, count(*)
+FROM people
+WHERE scholarity = 0
+GROUP BY country, scholarity
+
+SELECT country, idiom, count(*)
+FROM people
+WHERE idiom = 0
+GROUP BY country, idiom
+
+SELECT country, coordinates, count(*)
+FROM people
+WHERE coordinates = 0
+GROUP BY country, coordinates
+\end{minted}
+
+\section{Análise}
+
+O custo computacional pode ser dividido entre dois casos, conclui a equipe.
+Primeiramente o custo de que leitura. Apesar de testes em tentar ler concorrentemente
+múltiplas \textit{streams}, não houve ganho algum portanto a solução final permaneceu
+apenas um ator realizando a leitura. O segundo custo é o de processamento. Quanto mais complexa
+uma função de \textit{hashing} maior o tempo necessário para executá-la na larga quantidade
+de tuplas deste projeto, como evidenciado pela consulta número 3 cuja chave possui 16 \textit{bits}
+e não há nenhum filtro.
+
+Não obstante, estruturas de dados para armazenamento das tabelas de dispersão foram 
+consideradas. Enquanto \textit{Map} do próprio Elixir demonstrou-se eficiente em muitos casos,
+perdia performance em coleções maiores. Por alternativa, o módulo \textit{:array} do 
+\textit{erlang} configurou-se como próximo candidato, porém, os ganhos em performance foram
+desprezíveis, logo uma solução com \textit{Map} permaneceu canônica. Vale salientar, as
+estruturas \textit{chave-valor} em Elixir tem custos diferentes de constante para
+acesso e escrita, impactando no tempo processamento. \textit{Map}, por exemplo, até 31 chaves
+permanece implementado como lista encadeada e só no próxima chave é promovido a uma tabela de dispersão.
+Por outro lado, \textit{:array} do \textit{erlang} consta na realidade uma implementação de tuplas aninhadas
+cuja complexidade média de acesso é logarítmica de base 32.
+
+Curiosidade notada foi o fato de que as consultas com funções de \textit{hashing} semelhantes
+geravam tempos semelhante. Após um processo de verificação, notou-se que maior parte do
+custo estava na função que mapeava as pessoas às suas chaves.
+
+Averiguando a tabela nota-se que consultas como as de 5 a 10 tem um tempo inferior em
+relação às demais no banco binário. Isto ocorre devido às suas características de filtro. 
+Removendo uma parte do conjunto de entradas a serem processadas, tanto a função de \textit{hashing}
+quanto a atualização de acumuladores são deixadas de lado, enfatizando no custo destes
+procedimentos. Além disso, uma clara distinção entre o tempo das consultas do banco binário 
+contra o SGDB é que o SGBD mantém um padrão de 10 minutos nas suas enquanto o banco
+binário vezes requer mais tempo, demonstrando um claro espaço para melhora dos algoritmos.
+
+Em suma, o projeto foi um túnel de descobertas. Escolher o número certo de ou ao menos
+próximo do ideal para tamanhos de leitura, quantidade de atores concorrentes, tamanho de
+\textit{buffers} de leitura, dentre outros desafios que tornaram o processo de otimizar
+este trabalho um labirinto de variáveis. No fim do dia, sempre há espaço para crescimento.
+Talvez depois de buscarmos mais conhecimento em Elixir. Talvez em uma linguagem diferente
+para consolidar impedimentos encontrados na linguagem atual. Não muda, porém, é o fato
+de que através da experiência é que saem resultados.
+
+% \bibliographystyle{sbc}
+% \bibliography{sbc-template}
+
+\end{document}
